@@ -63,38 +63,139 @@ func Main() error {
 	}
 	log.Println("allowed domains:", host)
 	c := colly.NewCollector(colly.AllowedDomains(host),
-		colly.MaxDepth(2), colly.AllowURLRevisit(), colly.Async(false))
+		colly.MaxDepth(2), colly.AllowURLRevisit(), colly.Async(true))
 	c.SetClient(&client)
+	c.Limit(&colly.LimitRule{Parallelism: 8})
 
-	var mu sync.RWMutex
 	var max int
 	maxer := c.Clone()
-	maxer.OnHTML(`a[href]`, func(e *colly.HTMLElement) {
-		foundURL := e.Request.AbsoluteURL(e.Attr("href"))
-		if i := strings.Index(foundURL, "/view.php?id="); i >= 0 {
-			if i, err := strconv.Atoi(foundURL[i+13:]); err != nil {
-				log.Printf("%q: %w", foundURL[i+13:], err)
-			} else {
-				mu.RLock()
-				better := max < i
-				mu.RUnlock()
-				if better {
-					mu.Lock()
-					if max < i {
-						max = i
+	{
+		var mu sync.RWMutex
+		maxer.OnHTML(`a[href]`, func(e *colly.HTMLElement) {
+			foundURL := e.Request.AbsoluteURL(e.Attr("href"))
+			if i := strings.Index(foundURL, "/view.php?id="); i >= 0 {
+				if i, err := strconv.Atoi(foundURL[i+13:]); err != nil {
+					log.Printf("%q: %w", foundURL[i+13:], err)
+				} else {
+					mu.RLock()
+					better := max < i
+					mu.RUnlock()
+					if better {
+						mu.Lock()
+						if max < i {
+							max = i
+						}
+						mu.Unlock()
 					}
-					mu.Unlock()
 				}
 			}
-		}
-	})
+		})
+	}
 	if err = maxer.Visit(appendPath(u, "my_view_page.php")); err != nil {
 		return err
 	}
 	maxer.Wait()
 	log.Print("max:", max)
-	vl := visitLimiter{prefix: (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: path.Dir(u.Path)}).String()}
 
+	cl := cloner{
+		c:           c,
+		projectPath: projectPath,
+		vl:          &visitLimiter{prefix: (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: path.Dir(u.Path)}).String()},
+	}
+
+	fh, err := os.Create(filepath.Join(projectPath, "index.html"))
+	if err != nil {
+		return err
+	}
+	defer fh.Close()
+	bw := bufio.NewWriter(fh)
+	fmt.Fprintf(bw, `<!DOCTYPE html>
+<html><head><title>%s</title><head><body><p>
+`, projectPath)
+	for i := 1; i <= max; i++ {
+		s := appendPath(u, "view.php") + "?id=" + strconv.Itoa(i)
+
+		log.Println("***", s, "***")
+		link, err := cl.Clone(ctx, s)
+		if err != nil {
+			return fmt.Errorf("visit %q: %w", u.String(), err)
+		}
+
+		if i != 0 && i%100 == 0 {
+			bw.WriteString("\n</p><p>\n")
+		}
+		if i := strings.LastIndexByte(s, '='); i >= 0 {
+			s = s[i+1:]
+		}
+		fmt.Fprintf(bw, "<a href=\"%s\">%s</a>\n", link, s)
+	}
+	bw.WriteString("\n</p></body></html>")
+	if err = bw.Flush(); err != nil {
+		return err
+	}
+	return fh.Close()
+}
+
+type cloner struct {
+	mu          sync.RWMutex
+	c           *colly.Collector
+	vl          *visitLimiter
+	linkMap     map[string]string
+	htmls       map[string]string
+	linkPairs   []string
+	projectPath string
+}
+
+func (cl *cloner) Clone(ctx context.Context, URL string) (string, error) {
+	if cl.linkMap == nil {
+		cl.linkMap = make(map[string]string, 64)
+		cl.htmls = make(map[string]string)
+	} else {
+		//cl.vl.Reset()
+		for k := range cl.linkMap {
+			delete(cl.linkMap, k)
+		}
+		for k := range cl.htmls {
+			delete(cl.htmls, k)
+		}
+	}
+	c := cl.collector()
+	if err := c.Visit(URL); err != nil {
+		return "", err
+	}
+	c.Wait()
+
+	cl.linkPairs = cl.linkPairs[:0]
+	for s, fn := range cl.linkMap {
+		bn := s
+		if i := strings.LastIndexByte(s, '/'); i >= 0 {
+			bn = s[i+1:]
+		}
+		cl.linkPairs = append(cl.linkPairs,
+			`="`+s+`"`, `="./`+fn+`"`,
+			`="`+strings.ReplaceAll(bn, "&", "&amp;")+`"`, `="./`+fn+`"`,
+		)
+	}
+	replacer := strings.NewReplacer(cl.linkPairs...)
+
+	for s, b := range cl.htmls {
+		fh, err := os.Create(filepath.Join(cl.projectPath, cl.linkMap[s]))
+		if err != nil {
+			return "", err
+		}
+		log.Println(s, "->", fh.Name())
+		if _, err := replacer.WriteString(fh, b); err != nil {
+			return "", fmt.Errorf("%q: %w", fh.Name(), err)
+		}
+		if err = fh.Close(); err != nil {
+			return "", err
+		}
+	}
+	return cl.linkMap[URL], nil
+}
+
+func (cl *cloner) collector() *colly.Collector {
+	c := cl.c.Clone()
 	c.OnHTML(`a[href]`, func(e *colly.HTMLElement) {
 		foundURL := e.Attr("href")
 		bn := foundURL
@@ -106,33 +207,31 @@ func Main() error {
 			return
 		}
 		e.Request.Ctx.Put("Referer", e.Request.URL.String())
-		if vl.Allow(foundURL) {
+		if cl.vl.Allow(foundURL) {
 			e.Request.Visit(foundURL)
 		}
 	})
 
 	c.OnHTML("link[rel='stylesheet']", func(e *colly.HTMLElement) {
-		if URL := e.Attr("href"); vl.Allow(URL) {
+		if URL := e.Attr("href"); cl.vl.Allow(URL) {
 			e.Request.Visit(URL)
 		}
 	})
 
 	// search for all script tags with src attribute -- JS
 	c.OnHTML("script[src]", func(e *colly.HTMLElement) {
-		if URL := e.Attr("src"); vl.Allow(URL) {
+		if URL := e.Attr("src"); cl.vl.Allow(URL) {
 			e.Request.Visit(URL)
 		}
 	})
 
 	// serach for all img tags with src attribute -- Images
 	c.OnHTML("img[src]", func(e *colly.HTMLElement) {
-		if URL := e.Attr("src"); vl.Allow(URL) {
+		if URL := e.Attr("src"); cl.vl.Allow(URL) {
 			e.Request.Visit(URL)
 		}
 	})
 
-	linkMap := make(map[string]string, 8192)
-	htmls := make(map[string]string, 8192)
 	c.OnScraped(func(resp *colly.Response) {
 		if resp.StatusCode >= 300 || len(resp.Body) == 0 {
 			return
@@ -141,80 +240,21 @@ func Main() error {
 		u := resp.Request.URL
 		fn := getFilename(u, resp.Headers, hsh[:])
 		s := u.String()
-		mu.Lock()
-		linkMap[s] = fn
-		mu.Unlock()
+		cl.mu.Lock()
+		cl.linkMap[s] = fn
+		cl.mu.Unlock()
 
 		if strings.HasSuffix(fn, ".htm") || strings.HasSuffix(fn, ".html") {
-			mu.Lock()
-			htmls[s] = string(resp.Body)
-			mu.Unlock()
+			cl.mu.Lock()
+			cl.htmls[s] = string(resp.Body)
+			cl.mu.Unlock()
 		} else {
-			fn = filepath.Join(projectPath, fn)
+			fn = filepath.Join(cl.projectPath, fn)
 			log.Println(u.String(), "->", fn)
 			renameio.WriteFile(fn, resp.Body, 0444)
 		}
 	})
-
-	index := make([]string, 0, max)
-	for i := 1; i <= max; i++ {
-		path := appendPath(u, "view.php") + "?id=" + strconv.Itoa(i)
-		if err := c.Visit(path); err != nil {
-			return fmt.Errorf("visit %q: %w", u.String(), err)
-		}
-		index = append(index, path)
-	}
-
-	c.Wait()
-
-	linkPairs := make([]string, 0, len(linkMap)*2)
-	for s, fn := range linkMap {
-		bn := s
-		if i := strings.LastIndexByte(s, '/'); i >= 0 {
-			bn = s[i+1:]
-		}
-		linkPairs = append(linkPairs,
-			`="`+s+`"`, `="./`+fn+`"`,
-			`="`+strings.ReplaceAll(bn, "&", "&amp;")+`"`, `="./`+fn+`"`,
-		)
-	}
-	replacer := strings.NewReplacer(linkPairs...)
-	for s, b := range htmls {
-		fh, err := os.Create(filepath.Join(projectPath, linkMap[s]))
-		if err != nil {
-			return err
-		}
-		replacer.WriteString(fh, b)
-		if err = fh.Close(); err != nil {
-			return err
-		}
-	}
-
-	fh, err := os.Create(filepath.Join(projectPath, "index.html"))
-	if err != nil {
-		return err
-	}
-	defer fh.Close()
-	log.Printf("Writing %q...", fh.Name())
-	bw := bufio.NewWriter(fh)
-	fmt.Fprintf(bw, `<!DOCTYPE html>
-<html><head><title>%s</title><head><body><p>
-`, projectPath)
-	for i, path := range index {
-		if i%100 == 0 {
-			bw.WriteString("\n</p><p>\n")
-		}
-		link := linkMap[path]
-		if i := strings.LastIndexByte(path, '='); i >= 0 {
-			path = path[i+1:]
-		}
-		fmt.Fprintf(bw, "<a href=\"%s\">%s</a>\n", link, path)
-	}
-	bw.WriteString("\n</p></body></html>")
-	if err = bw.Flush(); err != nil {
-		return err
-	}
-	return fh.Close()
+	return c
 }
 
 func appendPath(u *url.URL, plusPath string) string {
@@ -305,4 +345,9 @@ func (vl *visitLimiter) Allow(URL string) bool {
 	}
 	vl.seen[s] = struct{}{}
 	return true
+}
+func (vl *visitLimiter) Reset() {
+	for k := range vl.seen {
+		delete(vl.seen, k)
+	}
 }
