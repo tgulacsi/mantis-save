@@ -5,6 +5,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"context"
@@ -22,13 +23,12 @@ import (
 	"os"
 	"os/signal"
 	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gocolly/colly/v2"
-	"github.com/google/renameio"
 )
 
 func main() {
@@ -39,14 +39,15 @@ func main() {
 
 func Main() error {
 	//flagCookies := flag.String("cookiejar", "cookies.txt", "cookie jar")
+	flagOut := flag.String("o", "mantis.zip", "output (zip) file's name")
+	flagFirst := flag.Int("first", 1, "first issue to dump")
+	flagLast := flag.Int("last", 0, "last issue to dump (finds from my_view_page if <1")
 	flag.Parse()
 
 	u, err := url.Parse(flag.Arg(0))
 	if err != nil {
 		return fmt.Errorf("%q: %w", flag.Arg(0), err)
 	}
-	projectPath := filepath.Join(u.Host, filepath.FromSlash(path.Dir(u.Path)))
-	os.MkdirAll(projectPath, 0755)
 	var client http.Client
 	if client.Jar, err = cookiejar.New(&cookiejar.Options{}); err != nil {
 		return err
@@ -67,9 +68,9 @@ func Main() error {
 	c.SetClient(&client)
 	c.Limit(&colly.LimitRule{Parallelism: 8})
 
-	var max int
-	maxer := c.Clone()
-	{
+	max := *flagLast
+	if max < 1 {
+		maxer := c.Clone()
 		var mu sync.RWMutex
 		maxer.OnHTML(`a[href]`, func(e *colly.HTMLElement) {
 			foundURL := e.Request.AbsoluteURL(e.Attr("href"))
@@ -90,29 +91,30 @@ func Main() error {
 				}
 			}
 		})
-	}
-	if err = maxer.Visit(appendPath(u, "my_view_page.php")); err != nil {
-		return err
-	}
-	maxer.Wait()
-	log.Print("max:", max)
-
-	cl := cloner{
-		c:           c,
-		projectPath: projectPath,
-		vl:          &visitLimiter{prefix: (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: path.Dir(u.Path)}).String()},
+		if err = maxer.Visit(appendPath(u, "my_view_page.php")); err != nil {
+			return err
+		}
+		maxer.Wait()
 	}
 
-	fh, err := os.Create(filepath.Join(projectPath, "index.html"))
+	zipFh, err := os.Create(*flagOut)
 	if err != nil {
 		return err
 	}
-	defer fh.Close()
-	bw := bufio.NewWriter(fh)
-	fmt.Fprintf(bw, `<!DOCTYPE html>
+	defer zipFh.Close()
+
+	cl := cloner{
+		c:  c,
+		zw: zip.NewWriter(zipFh),
+		vl: &visitLimiter{prefix: (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: path.Dir(u.Path)}).String()},
+	}
+
+	var index bytes.Buffer
+	fmt.Fprintf(&index, `<!DOCTYPE html>
 <html><head><title>%s</title><head><body><p>
-`, projectPath)
-	for i := 1; i <= max; i++ {
+`, path.Dir(u.Path))
+	log.Println("first:", *flagFirst, "last:", max)
+	for i := *flagFirst; i <= max; i++ {
 		s := appendPath(u, "view.php") + "?id=" + strconv.Itoa(i)
 
 		log.Println("***", s, "***")
@@ -122,28 +124,46 @@ func Main() error {
 		}
 
 		if i != 0 && i%100 == 0 {
-			bw.WriteString("\n</p><p>\n")
+			io.WriteString(&index, "\n</p><p>\n")
 		}
 		if i := strings.LastIndexByte(s, '='); i >= 0 {
 			s = s[i+1:]
 		}
-		fmt.Fprintf(bw, "<a href=\"%s\">%s</a>\n", link, s)
+		fmt.Fprintf(&index, "<a href=\"%s\">%s</a>\n", link, s)
 	}
-	bw.WriteString("\n</p></body></html>")
-	if err = bw.Flush(); err != nil {
+	io.WriteString(&index, "\n</p></body></html>")
+
+	w, err := cl.zw.CreateHeader(&zip.FileHeader{Name: "index.html", Flags: zip.Deflate, Modified: time.Now()})
+	if err != nil {
 		return err
 	}
-	return fh.Close()
+	if _, err = w.Write(index.Bytes()); err != nil {
+		return err
+	}
+
+	if err = cl.Close(); err != nil {
+		return err
+	}
+	return zipFh.Close()
 }
 
 type cloner struct {
-	mu          sync.RWMutex
-	c           *colly.Collector
-	vl          *visitLimiter
-	linkMap     map[string]string
-	htmls       map[string]string
-	linkPairs   []string
-	projectPath string
+	mu        sync.RWMutex
+	c         *colly.Collector
+	vl        *visitLimiter
+	linkMap   map[string]string
+	htmls     map[string]string
+	linkPairs []string
+	zw        *zip.Writer
+}
+
+func (cl *cloner) Close() error {
+	zw := cl.zw
+	cl.zw = nil
+	if zw != nil {
+		return zw.Close()
+	}
+	return nil
 }
 
 func (cl *cloner) Clone(ctx context.Context, URL string) (string, error) {
@@ -178,17 +198,20 @@ func (cl *cloner) Clone(ctx context.Context, URL string) (string, error) {
 	}
 	replacer := strings.NewReplacer(cl.linkPairs...)
 
+	now := time.Now()
 	for s, b := range cl.htmls {
-		fh, err := os.Create(filepath.Join(cl.projectPath, cl.linkMap[s]))
+		fn := cl.linkMap[s]
+		cl.mu.Lock()
+		w, err := cl.zw.CreateHeader(&zip.FileHeader{Name: fn, Method: zip.Deflate, Modified: now})
 		if err != nil {
+			cl.mu.Unlock()
 			return "", err
 		}
-		log.Println(s, "->", fh.Name())
-		if _, err := replacer.WriteString(fh, b); err != nil {
-			return "", fmt.Errorf("%q: %w", fh.Name(), err)
-		}
-		if err = fh.Close(); err != nil {
-			return "", err
+		//log.Println(s, "->", fn)
+		_, err = replacer.WriteString(w, b)
+		cl.mu.Unlock()
+		if err != nil {
+			return "", fmt.Errorf("%q: %w", fn, err)
 		}
 	}
 	return cl.linkMap[URL], nil
@@ -249,9 +272,11 @@ func (cl *cloner) collector() *colly.Collector {
 			cl.htmls[s] = string(resp.Body)
 			cl.mu.Unlock()
 		} else {
-			fn = filepath.Join(cl.projectPath, fn)
 			log.Println(u.String(), "->", fn)
-			renameio.WriteFile(fn, resp.Body, 0444)
+			cl.mu.Lock()
+			w, _ := cl.zw.CreateHeader(&zip.FileHeader{Name: fn, Method: zip.Store, Modified: time.Now()})
+			w.Write(resp.Body)
+			cl.mu.Unlock()
 		}
 	})
 	return c
@@ -320,7 +345,7 @@ type visitLimiter struct {
 }
 
 func (vl *visitLimiter) Allow(URL string) bool {
-	if URL[0] == '#' || URL[len(URL)-1] == '/' || strings.IndexByte(URL, '.') < 0 ||
+	if URL == "" || URL[0] == '#' || URL[len(URL)-1] == '/' || strings.IndexByte(URL, '.') < 0 ||
 		strings.HasPrefix(URL, "mailto:") || strings.Contains(URL, "my_view_page.php") ||
 		((strings.HasPrefix(URL, "http://") || strings.HasPrefix(URL, "https://")) && !strings.HasPrefix(URL, vl.prefix)) {
 		return false
