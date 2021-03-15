@@ -222,11 +222,11 @@ func (cl *cloner) collector() *colly.Collector {
 	c.OnHTML(`a[href]`, func(e *colly.HTMLElement) {
 		foundURL := e.Attr("href")
 		bn := foundURL
-		if i := strings.IndexByte(bn, '?'); i >= 0 {
+		if i := strings.IndexByte(bn, '?'); i >= 1 {
 			bn = bn[:i]
 		}
 		bn = path.Base(bn)
-		if bn == "login.php" || bn == "logout_page.php" || strings.HasSuffix(bn, "delete.php") {
+		if bn != "file_download.php" {
 			return
 		}
 		e.Request.Ctx.Put("Referer", e.Request.URL.String())
