@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -179,11 +180,18 @@ func (cl *cloner) Clone(ctx context.Context, URL string) (string, error) {
 			delete(cl.htmls, k)
 		}
 	}
-	c := cl.collector()
+	c, errCh := cl.collector()
 	if err := c.Visit(URL); err != nil {
 		return "", err
 	}
 	c.Wait()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return "", err
+		}
+	default:
+	}
 
 	cl.linkPairs = cl.linkPairs[:0]
 	for s, fn := range cl.linkMap {
@@ -217,7 +225,8 @@ func (cl *cloner) Clone(ctx context.Context, URL string) (string, error) {
 	return cl.linkMap[URL], nil
 }
 
-func (cl *cloner) collector() *colly.Collector {
+func (cl *cloner) collector() (*colly.Collector, <-chan error) {
+	errCh := make(chan error, runtime.GOMAXPROCS(-1))
 	c := cl.c.Clone()
 	c.OnHTML(`a[href]`, func(e *colly.HTMLElement) {
 		foundURL := e.Attr("href")
@@ -231,27 +240,47 @@ func (cl *cloner) collector() *colly.Collector {
 		}
 		e.Request.Ctx.Put("Referer", e.Request.URL.String())
 		if cl.vl.Allow(foundURL) {
-			e.Request.Visit(foundURL)
+			if err := e.Request.Visit(foundURL); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+			}
 		}
 	})
 
 	c.OnHTML("link[rel='stylesheet']", func(e *colly.HTMLElement) {
 		if URL := e.Attr("href"); cl.vl.Allow(URL) {
-			e.Request.Visit(URL)
+			if err := e.Request.Visit(URL); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+			}
 		}
 	})
 
 	// search for all script tags with src attribute -- JS
 	c.OnHTML("script[src]", func(e *colly.HTMLElement) {
 		if URL := e.Attr("src"); cl.vl.Allow(URL) {
-			e.Request.Visit(URL)
+			if err := e.Request.Visit(URL); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+			}
 		}
 	})
 
 	// serach for all img tags with src attribute -- Images
 	c.OnHTML("img[src]", func(e *colly.HTMLElement) {
 		if URL := e.Attr("src"); cl.vl.Allow(URL) {
-			e.Request.Visit(URL)
+			if err := e.Request.Visit(URL); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+			}
 		}
 	})
 
@@ -280,12 +309,21 @@ func (cl *cloner) collector() *colly.Collector {
 				method = zip.Deflate
 			}
 			cl.mu.Lock()
-			w, _ := cl.zw.CreateHeader(&zip.FileHeader{Name: fn, Method: method, Modified: time.Now()})
-			w.Write(resp.Body)
+			w, err := cl.zw.CreateHeader(&zip.FileHeader{Name: fn, Method: method, Modified: time.Now()})
+			if err == nil {
+				_, err = w.Write(resp.Body)
+			}
 			cl.mu.Unlock()
+			if err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
 		}
 	})
-	return c
+	return c, errCh
 }
 
 func appendPath(u *url.URL, plusPath string) string {
