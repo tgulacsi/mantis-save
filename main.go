@@ -267,14 +267,20 @@ func (cl *cloner) collector() *colly.Collector {
 		cl.linkMap[s] = fn
 		cl.mu.Unlock()
 
-		if strings.HasSuffix(fn, ".htm") || strings.HasSuffix(fn, ".html") {
+		ext := strings.ToLower(path.Ext(fn))
+		if ext == ".htm" || ext == ".html" {
 			cl.mu.Lock()
 			cl.htmls[s] = string(resp.Body)
 			cl.mu.Unlock()
 		} else {
-			log.Println(u.String(), "->", fn)
+			//log.Println(u.String(), "->", fn)
+			method := zip.Store
+			switch ext {
+			case ".csv", ".txt", ".css", ".xml", ".log", ".js", ".php":
+				method = zip.Deflate
+			}
 			cl.mu.Lock()
-			w, _ := cl.zw.CreateHeader(&zip.FileHeader{Name: fn, Method: zip.Store, Modified: time.Now()})
+			w, _ := cl.zw.CreateHeader(&zip.FileHeader{Name: fn, Method: method, Modified: time.Now()})
 			w.Write(resp.Body)
 			cl.mu.Unlock()
 		}
