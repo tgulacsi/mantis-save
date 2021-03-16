@@ -16,20 +16,19 @@ import (
 	"io"
 	"log"
 	"mime"
-	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"os/signal"
 	"path"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gocolly/colly/v2"
+	"golang.org/x/net/html"
+	"golang.org/x/sync/errgroup"
 )
 
 func main() {
@@ -43,6 +42,7 @@ func Main() error {
 	flagOut := flag.String("o", "mantis.zip", "output (zip) file's name")
 	flagFirst := flag.Int("first", 1, "first issue to dump")
 	flagLast := flag.Int("last", 0, "last issue to dump (finds from my_view_page if <1")
+	flagConcurrency := flag.Int("concurrency", 8, "concurrency")
 	flag.Parse()
 
 	u, err := url.Parse(flag.Arg(0))
@@ -55,47 +55,42 @@ func Main() error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
-	client.Transport = contextInjectingTransport{ctx: ctx, tr: http.DefaultTransport}
 	if err = doLogin(ctx, &client, u); err != nil {
 		return err
 	}
-	host, _, _ := net.SplitHostPort(u.Host)
-	if host == "" {
-		host = u.Host
-	}
-	log.Println("allowed domains:", host)
-	c := colly.NewCollector(colly.AllowedDomains(host),
-		colly.MaxDepth(2), colly.AllowURLRevisit(), colly.Async(true))
-	c.SetClient(&client)
-	c.Limit(&colly.LimitRule{Parallelism: 8})
+	c := newCollector(&client)
 
 	max := *flagLast
 	if max < 1 {
-		maxer := c.Clone()
 		var mu sync.RWMutex
-		maxer.OnHTML(`a[href]`, func(e *colly.HTMLElement) {
-			foundURL := e.Request.AbsoluteURL(e.Attr("href"))
-			if i := strings.Index(foundURL, "/view.php?id="); i >= 0 {
-				if i, err := strconv.Atoi(foundURL[i+13:]); err != nil {
-					log.Printf("%q: %w", foundURL[i+13:], err)
-				} else {
-					mu.RLock()
-					better := max < i
-					mu.RUnlock()
-					if better {
-						mu.Lock()
-						if max < i {
-							max = i
+		if err = c.Visit(
+			ctx,
+			appendPath(u, "my_view_page.php"),
+			visitTodoMap{
+				tagAttr{Tag: "a", Attr: "href"}: func(_ *url.URL, foundURL string) error {
+					if i := strings.Index(foundURL, "/view.php?id="); i >= 0 {
+						if i, err := strconv.Atoi(foundURL[i+13:]); err != nil {
+							log.Printf("%q: %w", foundURL[i+13:], err)
+						} else {
+							mu.RLock()
+							better := max < i
+							mu.RUnlock()
+							if better {
+								mu.Lock()
+								if max < i {
+									max = i
+								}
+								mu.Unlock()
+							}
 						}
-						mu.Unlock()
 					}
-				}
-			}
-		})
-		if err = maxer.Visit(appendPath(u, "my_view_page.php")); err != nil {
+					return nil
+				},
+			},
+			nil,
+		); err != nil {
 			return err
 		}
-		maxer.Wait()
 	}
 
 	zipFh, err := os.Create(*flagOut)
@@ -104,70 +99,91 @@ func Main() error {
 	}
 	defer zipFh.Close()
 
+	var zwMu sync.Mutex
+	zwSeen := make(map[string]struct{})
+	zw := zip.NewWriter(zipFh)
 	cl := cloner{
 		c:  c,
-		zw: zip.NewWriter(zipFh),
 		vl: &visitLimiter{prefix: (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: path.Dir(u.Path)}).String()},
+		WriteFile: func(fn string, compress bool, body []byte) error {
+			zwMu.Lock()
+			defer zwMu.Unlock()
+			if _, ok := zwSeen[fn]; ok {
+				return nil
+			}
+			method := zip.Store
+			if compress {
+				method = zip.Deflate
+			}
+			w, err := zw.CreateHeader(&zip.FileHeader{Name: fn, Method: method, Modified: time.Now()})
+			if err == nil {
+				_, err = w.Write(body)
+			}
+			zwSeen[fn] = struct{}{}
+			return err
+		},
 	}
 
-	var index bytes.Buffer
-	fmt.Fprintf(&index, `<!DOCTYPE html>
-<html><head><title>%s</title><head><body><p>
-`, path.Dir(u.Path))
+	links := make([]string, max-*flagFirst+1)
 	log.Println("first:", *flagFirst, "last:", max)
+	limitCh := make(chan struct{}, *flagConcurrency)
+	grp, grpCtx := errgroup.WithContext(ctx)
 	for i := *flagFirst; i <= max; i++ {
+		if err := grpCtx.Err(); err != nil {
+			return err
+		}
+		i := i
 		s := appendPath(u, "view.php") + "?id=" + strconv.Itoa(i)
-
-		log.Println("***", s, "***")
-		link, err := cl.Clone(ctx, s)
-		if err != nil {
-			return fmt.Errorf("visit %q: %w", u.String(), err)
-		}
-
-		if i != 0 && i%100 == 0 {
-			io.WriteString(&index, "\n</p><p>\n")
-		}
-		if i := strings.LastIndexByte(s, '='); i >= 0 {
-			s = s[i+1:]
-		}
-		fmt.Fprintf(&index, "<a href=\"%s\">%s</a>\n", link, s)
+		limitCh <- struct{}{}
+		cl := cl
+		grp.Go(func() error {
+			defer func() { <-limitCh }()
+			log.Println("***", s, "***")
+			link, err := cl.Clone(grpCtx, s)
+			if err != nil {
+				return fmt.Errorf("visit %q: %w", u.String(), err)
+			}
+			links[i-*flagFirst] = link
+			return nil
+		})
 	}
-	io.WriteString(&index, "\n</p></body></html>")
+	if err := grp.Wait(); err != nil {
+		return err
+	}
 
-	w, err := cl.zw.CreateHeader(&zip.FileHeader{Name: "index.html", Flags: zip.Deflate, Modified: time.Now()})
+	w, err := zw.CreateHeader(&zip.FileHeader{Name: "index.html", Flags: zip.Deflate, Modified: time.Now()})
 	if err != nil {
 		return err
 	}
-	if _, err = w.Write(index.Bytes()); err != nil {
+	fmt.Fprintf(w, `<!DOCTYPE html>
+<html><head><title>%s</title><head><body><p>
+`, path.Dir(u.Path))
+	for i, link := range links {
+		if i != 0 && i%100 == 0 {
+			io.WriteString(w, "\n</p><p>\n")
+		}
+		fmt.Fprintf(w, "<a href=\"%s\">%d</a>\n", link, i+*flagFirst)
+	}
+	io.WriteString(w, "\n</p></body></html>")
+
+	if err := zw.Close(); err != nil {
 		return err
 	}
 
-	if err = cl.Close(); err != nil {
-		return err
-	}
 	return zipFh.Close()
 }
 
 type cloner struct {
-	mu        sync.RWMutex
-	c         *colly.Collector
+	c         *collector
 	vl        *visitLimiter
 	linkMap   map[string]string
-	htmls     map[string]string
 	linkPairs []string
-	zw        *zip.Writer
-}
-
-func (cl *cloner) Close() error {
-	zw := cl.zw
-	cl.zw = nil
-	if zw != nil {
-		return zw.Close()
-	}
-	return nil
+	htmls     map[string]string
+	WriteFile func(fn string, compress bool, body []byte) error
 }
 
 func (cl *cloner) Clone(ctx context.Context, URL string) (string, error) {
+	//cl.mu.Lock()
 	if cl.linkMap == nil {
 		cl.linkMap = make(map[string]string, 64)
 		cl.htmls = make(map[string]string)
@@ -180,19 +196,14 @@ func (cl *cloner) Clone(ctx context.Context, URL string) (string, error) {
 			delete(cl.htmls, k)
 		}
 	}
-	c, errCh := cl.collector()
-	if err := c.Visit(URL); err != nil {
+	visit := cl.collector()
+	//cl.mu.Unlock()
+	if err := visit(ctx, URL); err != nil {
 		return "", err
 	}
-	c.Wait()
-	select {
-	case err := <-errCh:
-		if err != nil {
-			return "", err
-		}
-	default:
-	}
 
+	//cl.mu.Lock()
+	//defer cl.mu.Unlock()
 	cl.linkPairs = cl.linkPairs[:0]
 	for s, fn := range cl.linkMap {
 		bn := s
@@ -206,124 +217,132 @@ func (cl *cloner) Clone(ctx context.Context, URL string) (string, error) {
 	}
 	replacer := strings.NewReplacer(cl.linkPairs...)
 
-	now := time.Now()
+	var buf bytes.Buffer
 	for s, b := range cl.htmls {
 		fn := cl.linkMap[s]
-		cl.mu.Lock()
-		w, err := cl.zw.CreateHeader(&zip.FileHeader{Name: fn, Method: zip.Deflate, Modified: now})
-		if err != nil {
-			cl.mu.Unlock()
-			return "", err
-		}
-		//log.Println(s, "->", fn)
-		_, err = replacer.WriteString(w, b)
-		cl.mu.Unlock()
+		buf.Reset()
+		_, err := replacer.WriteString(&buf, b)
 		if err != nil {
 			return "", fmt.Errorf("%q: %w", fn, err)
 		}
+		err = cl.WriteFile(fn, true, buf.Bytes())
+		if err != nil {
+			return "", err
+		}
+		//log.Println(s, "->", fn)
 	}
 	return cl.linkMap[URL], nil
 }
 
-func (cl *cloner) collector() (*colly.Collector, <-chan error) {
-	errCh := make(chan error, runtime.GOMAXPROCS(-1))
-	c := cl.c.Clone()
-	c.OnHTML(`a[href]`, func(e *colly.HTMLElement) {
-		foundURL := e.Attr("href")
-		bn := foundURL
-		if i := strings.IndexByte(bn, '?'); i >= 1 {
-			bn = bn[:i]
-		}
-		bn = path.Base(bn)
-		if bn != "file_download.php" {
-			return
-		}
-		e.Request.Ctx.Put("Referer", e.Request.URL.String())
-		if cl.vl.Allow(foundURL) {
-			if err := e.Request.Visit(foundURL); err != nil {
-				select {
-				case errCh <- err:
-				default:
+func (cl *cloner) collector() (visit func(context.Context, string) error) {
+	return func(ctx context.Context, URL string) error {
+		saveResp := func(ctx context.Context, resp *http.Response) error {
+			var body []byte
+			brc, ok := resp.Body.(byteReadCloser)
+			if ok {
+				body = brc.p
+			} else {
+				var buf bytes.Buffer
+				if _, err := io.Copy(&buf, resp.Body); err != nil {
+					return err
 				}
+				body = buf.Bytes()
 			}
-		}
-	})
+			if len(body) == 0 {
+				return nil
+			}
+			hsh := sha512.Sum512_224(body)
+			u := resp.Request.URL
+			fn := getFilename(u, resp.Header, hsh[:])
+			s := u.String()
+			//cl.mu.Lock()
+			cl.linkMap[s] = fn
+			//cl.mu.Unlock()
 
-	c.OnHTML("link[rel='stylesheet']", func(e *colly.HTMLElement) {
-		if URL := e.Attr("href"); cl.vl.Allow(URL) {
-			if err := e.Request.Visit(URL); err != nil {
-				select {
-				case errCh <- err:
-				default:
+			//log.Println(u.String(), fn)
+			ext := strings.ToLower(path.Ext(fn))
+			if ext == ".htm" || ext == ".html" {
+				//cl.mu.Lock()
+				cl.htmls[s] = string(body)
+				//cl.mu.Unlock()
+			} else {
+				//log.Println(u.String(), "->", fn)
+				var compress bool
+				switch ext {
+				case ".csv", ".txt", ".css", ".xml", ".log", ".js", ".php":
+					compress = true
 				}
+				return cl.WriteFile(fn, compress, body)
 			}
+			return nil
 		}
-	})
-
-	// search for all script tags with src attribute -- JS
-	c.OnHTML("script[src]", func(e *colly.HTMLElement) {
-		if URL := e.Attr("src"); cl.vl.Allow(URL) {
-			if err := e.Request.Visit(URL); err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
-			}
-		}
-	})
-
-	// serach for all img tags with src attribute -- Images
-	c.OnHTML("img[src]", func(e *colly.HTMLElement) {
-		if URL := e.Attr("src"); cl.vl.Allow(URL) {
-			if err := e.Request.Visit(URL); err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
-			}
-		}
-	})
-
-	c.OnScraped(func(resp *colly.Response) {
-		if resp.StatusCode >= 300 || len(resp.Body) == 0 {
-			return
-		}
-		hsh := sha512.Sum512_224(resp.Body)
-		u := resp.Request.URL
-		fn := getFilename(u, resp.Headers, hsh[:])
-		s := u.String()
-		cl.mu.Lock()
-		cl.linkMap[s] = fn
-		cl.mu.Unlock()
-
-		ext := strings.ToLower(path.Ext(fn))
-		if ext == ".htm" || ext == ".html" {
-			cl.mu.Lock()
-			cl.htmls[s] = string(resp.Body)
-			cl.mu.Unlock()
-		} else {
-			//log.Println(u.String(), "->", fn)
-			method := zip.Store
-			switch ext {
-			case ".csv", ".txt", ".css", ".xml", ".log", ".js", ".php":
-				method = zip.Deflate
-			}
-			cl.mu.Lock()
-			w, err := cl.zw.CreateHeader(&zip.FileHeader{Name: fn, Method: method, Modified: time.Now()})
-			if err == nil {
-				_, err = w.Write(resp.Body)
-			}
-			cl.mu.Unlock()
+		save := func(ctx context.Context, URL string) error {
+			req, err := http.NewRequest("GET", URL, nil)
 			if err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
-				return
+				return err
 			}
+			resp, err := cl.c.Client.Do(req.WithContext(ctx))
+			if err != nil {
+				return err
+			}
+			return saveResp(ctx, resp)
 		}
-	})
-	return c, errCh
+
+		return cl.c.Visit(ctx, URL, visitTodoMap{
+			tagAttr{Tag: "a", Attr: "href"}: func(reqURL *url.URL, foundURL string) error {
+				bn := foundURL
+				if i := strings.IndexByte(bn, '?'); i >= 1 {
+					bn = bn[:i]
+				}
+				bn = path.Base(bn)
+				//log.Println("URL:", foundURL, "bn:", bn)
+				if bn != "file_download.php" {
+					return nil
+				}
+				if cl.vl.Allow(foundURL) {
+					return save(ctx, resolveURL(reqURL, foundURL))
+				}
+				return nil
+			},
+
+			tagAttr{Tag: "link", Attr: "href", AttrVal: attrVal{"rel", "stylesheet"}}: func(reqURL *url.URL, URL string) error {
+				if cl.vl.Allow(URL) {
+					return visit(ctx, resolveURL(reqURL, URL))
+				}
+				return nil
+			},
+
+			// search for all script tags with src attribute -- JS
+			tagAttr{Tag: "script", Attr: "src"}: func(reqURL *url.URL, URL string) error {
+				if cl.vl.Allow(URL) {
+					return save(ctx, resolveURL(reqURL, URL))
+				}
+				return nil
+			},
+
+			// serach for all img tags with src attribute -- Images
+			tagAttr{Tag: "img", Attr: "src"}: func(reqURL *url.URL, URL string) error {
+				if cl.vl.Allow(URL) {
+					return save(ctx, resolveURL(reqURL, URL))
+				}
+				return nil
+			},
+		},
+
+			saveResp,
+		)
+	}
+}
+
+func resolveURL(base *url.URL, relative string) string {
+	if strings.HasPrefix(relative, "https://") || strings.HasPrefix(relative, "http://") {
+		return relative
+	}
+	ref, err := url.Parse(relative)
+	if err != nil {
+		panic(err)
+	}
+	return base.ResolveReference(ref).String()
 }
 
 func appendPath(u *url.URL, plusPath string) string {
@@ -348,19 +367,7 @@ func doLogin(ctx context.Context, client *http.Client, u *url.URL) error {
 	return nil
 }
 
-type contextInjectingTransport struct {
-	ctx context.Context
-	tr  http.RoundTripper
-}
-
-func (tr contextInjectingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if err := tr.ctx.Err(); err != nil {
-		return nil, err
-	}
-	return tr.tr.RoundTrip(req.WithContext(tr.ctx))
-}
-
-func getFilename(u *url.URL, headers *http.Header, hsh []byte) string {
+func getFilename(u *url.URL, headers http.Header, hsh []byte) string {
 	var ext string
 	if headers != nil {
 		_, params, err := mime.ParseMediaType(headers.Get("Content-Disposition"))
@@ -381,6 +388,126 @@ func getFilename(u *url.URL, headers *http.Header, hsh []byte) string {
 	}
 	return base64.URLEncoding.EncodeToString(hsh) + ext
 }
+
+type collector struct {
+	*http.Client
+}
+
+func newCollector(client *http.Client) *collector {
+	if client == nil {
+		client = http.DefaultClient
+		var err error
+		if client.Jar, err = cookiejar.New(&cookiejar.Options{}); err != nil {
+			panic(err)
+		}
+	}
+	return &collector{Client: client}
+}
+func (c *collector) Visit(ctx context.Context, URL string, todo visitTodoMap, respFun func(ctx context.Context, resp *http.Response) error) error {
+	req, err := http.NewRequest("GET", URL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.Client.Do(req.WithContext(ctx))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("%s: %w", URL, resp.Status)
+	}
+	if len(todo) == 0 && respFun == nil {
+		return nil
+	}
+	if len(todo) == 0 {
+		return respFun(ctx, resp)
+	}
+
+	tags := make(map[string]tagAttr, len(todo))
+	for ta := range todo {
+		tags[ta.Tag] = ta
+	}
+	r := io.Reader(resp.Body)
+	var buf bytes.Buffer
+	if respFun != nil {
+		r = io.TeeReader(resp.Body, &buf)
+	}
+	z := html.NewTokenizer(r)
+	for {
+		tt := z.Next()
+		if tt == html.ErrorToken {
+			if err := z.Err(); err != nil && err != io.EOF {
+				return err
+			}
+			break
+		}
+		if tt != html.StartTagToken {
+			continue
+		}
+		tagB, hasAttr := z.TagName()
+		if !hasAttr {
+			continue
+		}
+		ta, ok := tags[string(tagB)]
+		if !ok {
+			continue
+		}
+		f := todo[ta]
+
+		wantB := []byte(ta.Attr)
+		if ta.AttrVal.Attr == "" {
+			for {
+				k, v, more := z.TagAttr()
+				if bytes.Equal(k, wantB) {
+					if err := f(resp.Request.URL, string(v)); err != nil {
+						return err
+					}
+				}
+				if !more {
+					break
+				}
+			}
+		} else {
+			wantC := []byte(ta.AttrVal.Attr)
+			var val string
+			var found bool
+			for {
+				k, v, more := z.TagAttr()
+				if bytes.Equal(k, wantB) {
+					val = string(v)
+				} else if !found && bytes.Equal(k, wantC) {
+					found = bytes.Equal(v, []byte(ta.AttrVal.Val))
+				}
+				if val != "" && found || !more {
+					break
+				}
+			}
+			if found && val != "" {
+				if err := f(resp.Request.URL, val); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if respFun != nil {
+		if _, err := io.Copy(&buf, resp.Body); err != nil {
+			return err
+		}
+		resp.Body = byteReadCloser{Reader: bytes.NewReader(buf.Bytes()), p: buf.Bytes()}
+		return respFun(ctx, resp)
+	}
+	return nil
+}
+
+type attrVal struct {
+	Attr, Val string
+}
+type tagAttr struct {
+	Tag, Attr string
+	AttrVal   attrVal
+}
+type visitTodoMap map[tagAttr]func(URL *url.URL, value string) error
 
 type visitLimiter struct {
 	mu     sync.RWMutex
@@ -420,3 +547,10 @@ func (vl *visitLimiter) Reset() {
 		delete(vl.seen, k)
 	}
 }
+
+type byteReadCloser struct {
+	*bytes.Reader
+	p []byte
+}
+
+func (b byteReadCloser) Close() error { return nil }
