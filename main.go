@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/peterbourgon/ff/v3/ffcli"
 	"golang.org/x/net/html"
 	"golang.org/x/sync/errgroup"
 )
@@ -38,139 +39,178 @@ func main() {
 }
 
 func Main() error {
-	//flagCookies := flag.String("cookiejar", "cookies.txt", "cookie jar")
-	flagOut := flag.String("o", "mantis.zip", "output (zip) file's name")
-	flagFirst := flag.Int("first", 1, "first issue to dump")
-	flagLast := flag.Int("last", 0, "last issue to dump (finds from my_view_page if <1")
-	flagConcurrency := flag.Int("concurrency", 8, "concurrency")
-	flag.Parse()
-
-	u, err := url.Parse(flag.Arg(0))
-	if err != nil {
-		return fmt.Errorf("%q: %w", flag.Arg(0), err)
-	}
-	var client http.Client
-	if client.Jar, err = cookiejar.New(&cookiejar.Options{}); err != nil {
-		return err
-	}
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer cancel()
-	if err = doLogin(ctx, &client, u); err != nil {
-		return err
-	}
-	c := newCollector(&client)
-
-	max := *flagLast
-	if max < 1 {
-		var mu sync.RWMutex
-		if err = c.Visit(
-			ctx,
-			appendPath(u, "my_view_page.php"),
-			visitTodoMap{
-				tagAttr{Tag: "a", Attr: "href"}: func(_ *url.URL, foundURL string) error {
-					if i := strings.Index(foundURL, "/view.php?id="); i >= 0 {
-						if i, err := strconv.Atoi(foundURL[i+13:]); err != nil {
-							log.Printf("%q: %w", foundURL[i+13:], err)
-						} else {
-							mu.RLock()
-							better := max < i
-							mu.RUnlock()
-							if better {
-								mu.Lock()
-								if max < i {
-									max = i
-								}
-								mu.Unlock()
-							}
-						}
-					}
-					return nil
-				},
-			},
-			nil,
-		); err != nil {
-			return err
+	prepare := func(ctx context.Context, args []string) (*collector, error) {
+		if len(args) == 0 {
+			return nil, fmt.Errorf("mantis URL with user:password is required")
 		}
+		u, err := url.Parse(args[0])
+		if err != nil {
+			return nil, fmt.Errorf("%q: %w", flag.Arg(0), err)
+		}
+		var client http.Client
+		if client.Jar, err = cookiejar.New(&cookiejar.Options{}); err != nil {
+			return nil, err
+		}
+		if err = doLogin(ctx, &client, u); err != nil {
+			return nil, err
+		}
+		return newCollector(u, &client), nil
 	}
 
-	zipFh, err := os.Create(*flagOut)
-	if err != nil {
-		return err
-	}
-	defer zipFh.Close()
-
-	var zwMu sync.Mutex
-	zwSeen := make(map[string]struct{})
-	zw := zip.NewWriter(zipFh)
-	cl := cloner{
-		c:  c,
-		vl: &visitLimiter{prefix: (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: path.Dir(u.Path)}).String()},
-		WriteFile: func(fn string, compress bool, body []byte) error {
-			zwMu.Lock()
-			defer zwMu.Unlock()
-			if _, ok := zwSeen[fn]; ok {
+	maxCmd := ffcli.Command{Name: "max", ShortHelp: "print out the max (visible) issue number",
+		Exec: func(ctx context.Context, args []string) error {
+			c, err := prepare(ctx, args)
+			if err != nil {
 				return nil
 			}
-			method := zip.Store
-			if compress {
-				method = zip.Deflate
+			max, err := c.getMaxIssueID(ctx)
+			if err != nil {
+				return err
 			}
-			w, err := zw.CreateHeader(&zip.FileHeader{Name: fn, Method: method, Modified: time.Now()})
-			if err == nil {
-				_, err = w.Write(body)
-			}
-			zwSeen[fn] = struct{}{}
-			return err
+			fmt.Println(max)
+			return nil
 		},
 	}
 
-	links := make([]string, max-*flagFirst+1)
-	log.Println("first:", *flagFirst, "last:", max)
-	limitCh := make(chan struct{}, *flagConcurrency)
-	grp, grpCtx := errgroup.WithContext(ctx)
-	for i := *flagFirst; i <= max; i++ {
-		if err := grpCtx.Err(); err != nil {
-			return err
-		}
-		i := i
-		s := appendPath(u, "view.php") + "?id=" + strconv.Itoa(i)
-		limitCh <- struct{}{}
-		cl := cl
-		grp.Go(func() error {
-			defer func() { <-limitCh }()
-			log.Println("***", s, "***")
-			link, err := cl.Clone(grpCtx, s)
+	fs := flag.NewFlagSet("save", flag.ContinueOnError)
+	flagOut := fs.String("o", "mantis.zip", "output (zip) file's name")
+	flagFirst := fs.Int("first", 1, "first issue to dump")
+	flagLast := fs.Int("last", 0, "last issue to dump (finds from my_view_page if <1")
+	flagConcurrency := fs.Int("concurrency", 8, "concurrency")
+	saveCmd := ffcli.Command{Name: "save", FlagSet: fs,
+		Exec: func(ctx context.Context, args []string) error {
+			c, err := prepare(ctx, args)
 			if err != nil {
-				return fmt.Errorf("visit %q: %w", u.String(), err)
+				return nil
 			}
-			links[i-*flagFirst] = link
-			return nil
-		})
-	}
-	if err := grp.Wait(); err != nil {
-		return err
-	}
 
-	w, err := zw.CreateHeader(&zip.FileHeader{Name: "index.html", Flags: zip.Deflate, Modified: time.Now()})
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(w, `<!DOCTYPE html>
+			max := *flagLast
+			if max < 1 {
+				if max, err = c.getMaxIssueID(ctx); err != nil {
+					return err
+				}
+
+			}
+
+			zipFh, err := os.Create(*flagOut)
+			if err != nil {
+				return err
+			}
+			defer zipFh.Close()
+
+			var zwMu sync.Mutex
+			zwSeen := make(map[string]struct{})
+			zw := zip.NewWriter(zipFh)
+			u := c.URL
+			cl := cloner{
+				c:  c,
+				vl: &visitLimiter{prefix: (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: path.Dir(u.Path)}).String()},
+				WriteFile: func(fn string, compress bool, body []byte) error {
+					zwMu.Lock()
+					defer zwMu.Unlock()
+					if _, ok := zwSeen[fn]; ok {
+						return nil
+					}
+					method := zip.Store
+					if compress {
+						method = zip.Deflate
+					}
+					w, err := zw.CreateHeader(&zip.FileHeader{Name: fn, Method: method, Modified: time.Now()})
+					if err == nil {
+						_, err = w.Write(body)
+					}
+					zwSeen[fn] = struct{}{}
+					return err
+				},
+			}
+
+			links := make([]string, max-*flagFirst+1)
+			log.Println("first:", *flagFirst, "last:", max)
+			limitCh := make(chan struct{}, *flagConcurrency)
+			grp, grpCtx := errgroup.WithContext(ctx)
+			for i := *flagFirst; i <= max; i++ {
+				if err := grpCtx.Err(); err != nil {
+					return err
+				}
+				i := i
+				s := appendPath(u, "view.php") + "?id=" + strconv.Itoa(i)
+				limitCh <- struct{}{}
+				cl := cl
+				grp.Go(func() error {
+					defer func() { <-limitCh }()
+					log.Println("***", s, "***")
+					link, err := cl.Clone(grpCtx, s)
+					if err != nil {
+						return fmt.Errorf("visit %q: %w", u.String(), err)
+					}
+					links[i-*flagFirst] = link
+					return nil
+				})
+			}
+			if err := grp.Wait(); err != nil {
+				return err
+			}
+
+			w, err := zw.CreateHeader(&zip.FileHeader{Name: "index.html", Flags: zip.Deflate, Modified: time.Now()})
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(w, `<!DOCTYPE html>
 <html><head><title>%s</title><head><body><p>
 `, path.Dir(u.Path))
-	for i, link := range links {
-		if i != 0 && i%100 == 0 {
-			io.WriteString(w, "\n</p><p>\n")
-		}
-		fmt.Fprintf(w, "<a href=\"%s\">%d</a>\n", link, i+*flagFirst)
-	}
-	io.WriteString(w, "\n</p></body></html>")
+			for i, link := range links {
+				if i != 0 && i%100 == 0 {
+					io.WriteString(w, "\n</p><p>\n")
+				}
+				fmt.Fprintf(w, "<a href=\"%s\">%d</a>\n", link, i+*flagFirst)
+			}
+			io.WriteString(w, "\n</p></body></html>")
 
-	if err := zw.Close(); err != nil {
-		return err
+			if err := zw.Close(); err != nil {
+				return err
+			}
+
+			return zipFh.Close()
+		},
 	}
 
-	return zipFh.Close()
+	appCmd := ffcli.Command{Name: "mantis-save",
+		Subcommands: []*ffcli.Command{&saveCmd, &maxCmd},
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+	return appCmd.ParseAndRun(ctx, os.Args[1:])
+}
+
+func (c *collector) getMaxIssueID(ctx context.Context) (max int, err error) {
+	var mu sync.RWMutex
+	err = c.Visit(
+		ctx,
+		appendPath(c.URL, "my_view_page.php"),
+		visitTodoMap{
+			tagAttr{Tag: "a", Attr: "href"}: func(_ *url.URL, foundURL string) error {
+				if i := strings.Index(foundURL, "/view.php?id="); i >= 0 {
+					if i, err := strconv.Atoi(foundURL[i+13:]); err != nil {
+						log.Printf("%q: %w", foundURL[i+13:], err)
+					} else {
+						mu.RLock()
+						better := max < i
+						mu.RUnlock()
+						if better {
+							mu.Lock()
+							if max < i {
+								max = i
+							}
+							mu.Unlock()
+						}
+					}
+				}
+				return nil
+			},
+		},
+		nil,
+	)
+	return max, err
 }
 
 type cloner struct {
@@ -391,9 +431,10 @@ func getFilename(u *url.URL, headers http.Header, hsh []byte) string {
 
 type collector struct {
 	*http.Client
+	URL *url.URL
 }
 
-func newCollector(client *http.Client) *collector {
+func newCollector(u *url.URL, client *http.Client) *collector {
 	if client == nil {
 		client = http.DefaultClient
 		var err error
@@ -401,7 +442,7 @@ func newCollector(client *http.Client) *collector {
 			panic(err)
 		}
 	}
-	return &collector{Client: client}
+	return &collector{URL: u, Client: client}
 }
 func (c *collector) Visit(ctx context.Context, URL string, todo visitTodoMap, respFun func(ctx context.Context, resp *http.Response) error) error {
 	req, err := http.NewRequest("GET", URL, nil)
