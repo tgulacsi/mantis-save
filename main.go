@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/renameio"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"golang.org/x/net/html"
 	"golang.org/x/sync/errgroup"
@@ -92,11 +93,11 @@ func Main() error {
 
 			}
 
-			zipFh, err := os.Create(*flagOut)
+			zipFh, err := renameio.TempFile("", *flagOut)
 			if err != nil {
 				return err
 			}
-			defer zipFh.Close()
+			defer zipFh.Cleanup()
 
 			var zwMu sync.Mutex
 			zwSeen := make(map[string]struct{})
@@ -170,7 +171,7 @@ func Main() error {
 				return err
 			}
 
-			return zipFh.Close()
+			return zipFh.CloseAtomicallyReplace()
 		},
 	}
 
