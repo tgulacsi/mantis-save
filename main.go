@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/renameio"
@@ -178,7 +179,7 @@ func Main() error {
 	appCmd := ffcli.Command{Name: "mantis-save",
 		Subcommands: []*ffcli.Command{&saveCmd, &maxCmd},
 	}
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	return appCmd.ParseAndRun(ctx, os.Args[1:])
 }
