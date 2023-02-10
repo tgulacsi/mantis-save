@@ -1,4 +1,4 @@
-// Copyright 2021 Tamás Gulácsi.
+// Copyright 2021, 2023 Tamás Gulácsi.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -28,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-shiori/obelisk"
 	"github.com/google/renameio"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"golang.org/x/net/html"
@@ -103,28 +104,41 @@ func Main() error {
 			var zwMu sync.Mutex
 			zwSeen := make(map[string]struct{})
 			zw := zip.NewWriter(zipFh)
-			u := c.URL
-			cl := cloner{
-				c:  c,
-				vl: &visitLimiter{prefix: (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: path.Dir(u.Path)}).String()},
-				WriteFile: func(fn string, compress bool, body []byte) error {
-					zwMu.Lock()
-					defer zwMu.Unlock()
-					if _, ok := zwSeen[fn]; ok {
-						return nil
-					}
-					method := zip.Store
-					if compress {
-						method = zip.Deflate
-					}
-					w, err := zw.CreateHeader(&zip.FileHeader{Name: fn, Method: method, Modified: time.Now()})
-					if err == nil {
-						_, err = w.Write(body)
-					}
-					zwSeen[fn] = struct{}{}
-					return err
-				},
+			writeFile := func(fn string, compress bool, body []byte) error {
+				zwMu.Lock()
+				defer zwMu.Unlock()
+				if _, ok := zwSeen[fn]; ok {
+					return nil
+				}
+				method := zip.Store
+				if compress {
+					method = zip.Deflate
+				}
+				w, err := zw.CreateHeader(&zip.FileHeader{Name: fn, Method: method, Modified: time.Now()})
+				if err == nil {
+					_, err = w.Write(body)
+				}
+				zwSeen[fn] = struct{}{}
+				return err
 			}
+
+			u := c.URL
+			/*
+				cl := cloner{
+					c:  c,
+					vl: &visitLimiter{prefix: (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: path.Dir(u.Path)}).String()},
+					WriteFile: writeFile,
+				}
+			*/
+			arc := &obelisk.Archiver{
+				Transport:             c.Client.Transport,
+				RequestTimeout:        10 * time.Second,
+				MaxRetries:            3,
+				MaxConcurrentDownload: 4,
+				SkipResourceURLError:  true,
+			}
+			arc = arc.WithCookies(c.Client.Jar.Cookies(c.URL))
+			arc.Validate()
 
 			links := make([]string, max-*flagFirst+1)
 			log.Println("first:", *flagFirst, "last:", max)
@@ -137,15 +151,29 @@ func Main() error {
 				i := i
 				s := appendPath(u, "view.php") + "?id=" + strconv.Itoa(i)
 				limitCh <- struct{}{}
-				cl := cl
+
+				//cl := cl
 				grp.Go(func() error {
 					defer func() { <-limitCh }()
 					log.Println("***", s, "***")
-					link, err := cl.Clone(grpCtx, s)
+					/*
+						link, err := cl.Clone(grpCtx, s)
+						if err != nil {
+							return fmt.Errorf("visit %q: %w", u.String(), err)
+						}
+					*/
+					body, ct, err := arc.Archive(grpCtx, obelisk.Request{URL: s})
+					log.Printf("archive %q: %d %q: %+v", u.String(), len(body), ct, err)
 					if err != nil {
-						return fmt.Errorf("visit %q: %w", u.String(), err)
+						return fmt.Errorf("archive %q: %w", u.String(), err)
 					}
-					links[i-*flagFirst] = link
+					fn := fmt.Sprintf("%05d.html")
+					compress := strings.HasPrefix(ct, "text/") || strings.HasPrefix(ct, "application/j")
+					if err = writeFile(fn, compress, body); err != nil {
+						return fmt.Errorf("writeFile %q: %w", fn, err)
+					}
+
+					links[i-*flagFirst] = "./" + fn
 					return nil
 				})
 			}
