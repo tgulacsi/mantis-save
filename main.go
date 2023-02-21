@@ -1,11 +1,10 @@
-// Copyright 2021 Tamás Gulácsi.
+// Copyright 2021, 2023 Tamás Gulácsi.
 //
 // SPDX-License-Identifier: Apache-2.0
 
 package main
 
 import (
-	"archive/zip"
 	"bufio"
 	"bytes"
 	"context"
@@ -28,7 +27,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/renameio"
+	"github.com/google/renameio/v2"
+	"github.com/klauspost/compress/zip"
+	"github.com/klauspost/compress/zstd"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"golang.org/x/net/html"
 	"golang.org/x/sync/errgroup"
@@ -103,6 +104,13 @@ func Main() error {
 			var zwMu sync.Mutex
 			zwSeen := make(map[string]struct{})
 			zw := zip.NewWriter(zipFh)
+			compr := zstd.ZipCompressor(
+				zstd.WithEncoderLevel(zstd.SpeedBetterCompression),
+				zstd.WithWindowSize(1<<20),
+			)
+			zw.RegisterCompressor(zstd.ZipMethodWinZip, compr)
+			zw.RegisterCompressor(zstd.ZipMethodPKWare, compr)
+
 			u := c.URL
 			cl := cloner{
 				c:  c,
@@ -115,7 +123,7 @@ func Main() error {
 					}
 					method := zip.Store
 					if compress {
-						method = zip.Deflate
+						method = zstd.ZipMethodWinZip
 					}
 					w, err := zw.CreateHeader(&zip.FileHeader{Name: fn, Method: method, Modified: time.Now()})
 					if err == nil {
