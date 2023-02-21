@@ -19,17 +19,16 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/google/renameio/v2"
-	"github.com/klauspost/compress/zip"
-	"github.com/klauspost/compress/zstd"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"golang.org/x/net/html"
 	"golang.org/x/sync/errgroup"
@@ -76,7 +75,7 @@ func Main() error {
 	}
 
 	fs := flag.NewFlagSet("save", flag.ContinueOnError)
-	flagOut := fs.String("o", "mantis.zip", "output (zip) file's name")
+	flagOut := fs.String("o", "mantis.squashfs", "output (zsquashfs) file's name")
 	flagFirst := fs.Int("first", 1, "first issue to dump")
 	flagLast := fs.Int("last", 0, "last issue to dump (finds from my_view_page if <1")
 	flagConcurrency := fs.Int("concurrency", 8, "concurrency")
@@ -95,22 +94,14 @@ func Main() error {
 
 			}
 
-			zipFh, err := renameio.TempFile("", *flagOut)
+			tempDir, err := os.MkdirTemp("", *flagOut)
 			if err != nil {
 				return err
 			}
-			defer zipFh.Cleanup()
+			defer os.RemoveAll(tempDir)
 
 			var zwMu sync.Mutex
 			zwSeen := make(map[string]struct{})
-			zw := zip.NewWriter(zipFh)
-			compr := zstd.ZipCompressor(
-				zstd.WithEncoderLevel(zstd.SpeedBetterCompression),
-				zstd.WithWindowSize(1<<20),
-			)
-			zw.RegisterCompressor(zstd.ZipMethodWinZip, compr)
-			zw.RegisterCompressor(zstd.ZipMethodPKWare, compr)
-
 			u := c.URL
 			cl := cloner{
 				c:  c,
@@ -121,16 +112,8 @@ func Main() error {
 					if _, ok := zwSeen[fn]; ok {
 						return nil
 					}
-					method := zip.Store
-					if compress {
-						method = zstd.ZipMethodWinZip
-					}
-					w, err := zw.CreateHeader(&zip.FileHeader{Name: fn, Method: method, Modified: time.Now()})
-					if err == nil {
-						_, err = w.Write(body)
-					}
 					zwSeen[fn] = struct{}{}
-					return err
+					return renameio.WriteFile(filepath.Join(tempDir, fn), body, 0640)
 				},
 			}
 
@@ -177,10 +160,12 @@ func Main() error {
 				return fmt.Errorf("too much errors: %d", n)
 			}
 
-			w, err := zw.CreateHeader(&zip.FileHeader{Name: "index.html", Flags: zip.Deflate, Modified: time.Now()})
+			indexFh, err := renameio.NewPendingFile(filepath.Join(tempDir, "index.html"))
 			if err != nil {
 				return err
 			}
+			defer indexFh.Cleanup()
+			w := indexFh
 			fmt.Fprintf(w, `<!DOCTYPE html>
 <html><head><title>%s</title><head><body><p>
 `, path.Dir(u.Path))
@@ -192,11 +177,18 @@ func Main() error {
 			}
 			io.WriteString(w, "\n</p></body></html>")
 
-			if err := zw.Close(); err != nil {
+			if err = indexFh.CloseAtomicallyReplace(); err != nil {
 				return err
 			}
 
-			return zipFh.CloseAtomicallyReplace()
+			cmd := exec.CommandContext(ctx, "mksquashfs", tempDir, *flagOut, "-comp", "xz")
+			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("%q: %w", cmd.Args, err)
+			}
+
+			return nil
 		},
 	}
 
