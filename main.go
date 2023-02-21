@@ -137,9 +137,10 @@ func Main() error {
 			links := make([]string, max-*flagFirst+1)
 			log.Println("first:", *flagFirst, "last:", max)
 			limitCh := make(chan struct{}, *flagConcurrency)
-			grp, grpCtx := errgroup.WithContext(ctx)
+			errCh := make(chan error, 1000)
+			var grp errgroup.Group
 			for i := *flagFirst; i <= max; i++ {
-				if err := grpCtx.Err(); err != nil {
+				if err := ctx.Err(); err != nil {
 					return err
 				}
 				i := i
@@ -148,10 +149,16 @@ func Main() error {
 				cl := cl
 				grp.Go(func() error {
 					defer func() { <-limitCh }()
-					log.Println("***", s, "***")
-					link, err := cl.Clone(grpCtx, s)
+					//log.Println("***", s, "***")
+					link, err := cl.Clone(ctx, s)
 					if err != nil {
-						return fmt.Errorf("visit %q: %w", u.String(), err)
+						err = fmt.Errorf("visit %q: %w", u.String(), err)
+						select {
+						case errCh <- err:
+							return nil
+						default:
+							return err
+						}
 					}
 					links[i-*flagFirst] = link
 					return nil
@@ -159,6 +166,15 @@ func Main() error {
 			}
 			if err := grp.Wait(); err != nil {
 				return err
+			}
+			close(errCh)
+			var n int
+			for err := range errCh {
+				log.Println(err)
+				n++
+			}
+			if n > 100 {
+				return fmt.Errorf("too much errors: %d", n)
 			}
 
 			w, err := zw.CreateHeader(&zip.FileHeader{Name: "index.html", Flags: zip.Deflate, Modified: time.Now()})
