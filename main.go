@@ -471,10 +471,10 @@ func (c *collector) Visit(ctx context.Context, URL string, todo visitTodoMap, re
 		return err
 	}
 	lvl := slog.LevelDebug
-	if rand.Int31n(10) < 1 {
+	if rand.Int31n(100) < 5 {
 		lvl = slog.LevelInfo
 	}
-	logger.Log(ctx, lvl, "visig", "url", URL)
+	logger.Log(ctx, lvl, "visit", "url", URL)
 	resp, err := c.Client.Do(req.WithContext(ctx))
 	if err != nil {
 		return err
