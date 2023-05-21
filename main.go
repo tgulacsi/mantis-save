@@ -13,7 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"math/rand"
 	"mime"
 	"net/http"
 	"net/http/cookiejar"
@@ -28,15 +28,22 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/google/renameio/v2"
-	"github.com/peterbourgon/ff/v3/ffcli"
+	"golang.org/x/exp/slog"
 	"golang.org/x/net/html"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/UNO-SOFT/zlog/v2"
+	"github.com/google/renameio/v2"
+	"github.com/peterbourgon/ff/v3/ffcli"
 )
+
+var verbose zlog.VerboseVar
+var logger = zlog.NewLogger(zlog.MaybeConsoleHandler(&verbose, os.Stderr)).SLog()
 
 func main() {
 	if err := Main(); err != nil {
-		log.Fatalf("%+v", err)
+		logger.Error("Main", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -75,7 +82,8 @@ func Main() error {
 	}
 
 	fs := flag.NewFlagSet("save", flag.ContinueOnError)
-	flagOut := fs.String("o", "mantis.squashfs", "output (zsquashfs) file's name")
+	fs.Var(&verbose, "v", "verbose logging")
+	flagOut := fs.String("o", "mantis.squashfs", "output (squashfs) file's name")
 	flagFirst := fs.Int("first", 1, "first issue to dump")
 	flagLast := fs.Int("last", 0, "last issue to dump (finds from my_view_page if <1")
 	flagConcurrency := fs.Int("concurrency", 8, "concurrency")
@@ -118,7 +126,7 @@ func Main() error {
 			}
 
 			links := make([]string, max-*flagFirst+1)
-			log.Println("first:", *flagFirst, "last:", max)
+			logger.Info("links", "first:", *flagFirst, "last:", max)
 			limitCh := make(chan struct{}, *flagConcurrency)
 			errCh := make(chan error, 1000)
 			var grp errgroup.Group
@@ -132,7 +140,6 @@ func Main() error {
 				cl := cl
 				grp.Go(func() error {
 					defer func() { <-limitCh }()
-					//log.Println("***", s, "***")
 					link, err := cl.Clone(ctx, s)
 					if err != nil {
 						err = fmt.Errorf("visit %q: %w", u.String(), err)
@@ -153,7 +160,7 @@ func Main() error {
 			close(errCh)
 			var n int
 			for err := range errCh {
-				log.Println(err)
+				logger.Error("visit", "error", err.Error())
 				n++
 			}
 			if n > 100 {
@@ -209,7 +216,7 @@ func (c *collector) getMaxIssueID(ctx context.Context) (max int, err error) {
 			tagAttr{Tag: "a", Attr: "href"}: func(_ *url.URL, foundURL string) error {
 				if i := strings.Index(foundURL, "/view.php?id="); i >= 0 {
 					if i, err := strconv.Atoi(foundURL[i+13:]); err != nil {
-						log.Printf("%q: %w", foundURL[i+13:], err)
+						logger.Error("getMaxIssueID", "url", foundURL[i+13:], "error", err)
 					} else {
 						mu.RLock()
 						better := max < i
@@ -287,7 +294,6 @@ func (cl *cloner) Clone(ctx context.Context, URL string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		//log.Println(s, "->", fn)
 	}
 	return cl.linkMap[URL], nil
 }
@@ -317,14 +323,12 @@ func (cl *cloner) collector() (visit func(context.Context, string) error) {
 			cl.linkMap[s] = fn
 			//cl.mu.Unlock()
 
-			//log.Println(u.String(), fn)
 			ext := strings.ToLower(path.Ext(fn))
 			if ext == ".htm" || ext == ".html" {
 				//cl.mu.Lock()
 				cl.htmls[s] = string(body)
 				//cl.mu.Unlock()
 			} else {
-				//log.Println(u.String(), "->", fn)
 				var compress bool
 				switch ext {
 				case ".csv", ".txt", ".css", ".xml", ".log", ".js", ".php":
@@ -353,7 +357,6 @@ func (cl *cloner) collector() (visit func(context.Context, string) error) {
 					bn = bn[:i]
 				}
 				bn = path.Base(bn)
-				//log.Println("URL:", foundURL, "bn:", bn)
 				if bn != "file_download.php" {
 					return nil
 				}
@@ -467,6 +470,11 @@ func (c *collector) Visit(ctx context.Context, URL string, todo visitTodoMap, re
 	if err != nil {
 		return err
 	}
+	lvl := slog.LevelDebug
+	if rand.Int31n(10) < 1 {
+		lvl = slog.LevelInfo
+	}
+	logger.Log(ctx, lvl, "visig", "url", URL)
 	resp, err := c.Client.Do(req.WithContext(ctx))
 	if err != nil {
 		return err
@@ -474,7 +482,7 @@ func (c *collector) Visit(ctx context.Context, URL string, todo visitTodoMap, re
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("%s: %w", URL, resp.Status)
+		return fmt.Errorf("%s: %s", URL, resp.Status)
 	}
 	if len(todo) == 0 && respFun == nil {
 		return nil
