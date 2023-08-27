@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand"
 	"mime"
 	"net/http"
@@ -28,7 +29,6 @@ import (
 	"sync"
 	"syscall"
 
-	"golang.org/x/exp/slog"
 	"golang.org/x/net/html"
 	"golang.org/x/sync/errgroup"
 
