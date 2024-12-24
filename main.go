@@ -1,4 +1,4 @@
-// Copyright 2021, 2023 Tamás Gulácsi.
+// Copyright 2021, 2024 Tamás Gulácsi.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/sha512"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -34,7 +35,9 @@ import (
 
 	"github.com/UNO-SOFT/zlog/v2"
 	"github.com/google/renameio/v2"
-	"github.com/peterbourgon/ff/v3/ffcli"
+	"github.com/peterbourgon/ff/v4"
+	"github.com/peterbourgon/ff/v4/ffhelp"
+	"github.com/tgulacsi/go/version"
 )
 
 var verbose zlog.VerboseVar
@@ -66,7 +69,7 @@ func Main() error {
 		return newCollector(u, &client), nil
 	}
 
-	maxCmd := ffcli.Command{Name: "max", ShortHelp: "print out the max (visible) issue number",
+	maxCmd := ff.Command{Name: "max", ShortHelp: "print out the max (visible) issue number",
 		Exec: func(ctx context.Context, args []string) error {
 			c, err := prepare(ctx, args)
 			if err != nil {
@@ -81,13 +84,14 @@ func Main() error {
 		},
 	}
 
-	fs := flag.NewFlagSet("save", flag.ContinueOnError)
-	fs.Var(&verbose, "v", "verbose logging")
-	flagOut := fs.String("o", "mantis.squashfs", "output (squashfs) file's name")
-	flagFirst := fs.Int("first", 1, "first issue to dump")
-	flagLast := fs.Int("last", 0, "last issue to dump (finds from my_view_page if <1")
-	flagConcurrency := fs.Int("concurrency", 8, "concurrency")
-	saveCmd := ffcli.Command{Name: "save", FlagSet: fs,
+	FS := flag.NewFlagSet("save", flag.ContinueOnError)
+	FS.Var(&verbose, "v", "verbose logging")
+	flagOut := FS.String("o", "mantis.squashfs", "output (squashfs) file's name")
+	flagFirst := FS.Int("first", 1, "first issue to dump")
+	flagLast := FS.Int("last", 0, "last issue to dump (finds from my_view_page if <1")
+	flagConcurrency := FS.Int("concurrency", 8, "concurrency")
+	saveCmd := ff.Command{Name: "save",
+		Flags: ff.NewFlagSetFrom(FS.Name(), FS),
 		Exec: func(ctx context.Context, args []string) error {
 			c, err := prepare(ctx, args)
 			if err != nil {
@@ -199,12 +203,27 @@ func Main() error {
 		},
 	}
 
-	appCmd := ffcli.Command{Name: "mantis-save",
-		Subcommands: []*ffcli.Command{&saveCmd, &maxCmd},
+	FFS := ff.NewFlagSet("mantis-save")
+	flagVersion := FFS.BoolLong("version", "print version")
+	appCmd := ff.Command{Name: "mantis-save",
+		Flags:       FFS,
+		Subcommands: []*ff.Command{&saveCmd, &maxCmd},
 	}
+	if err := appCmd.Parse(os.Args[1:]); err != nil {
+		ffhelp.Command(&appCmd).WriteTo(os.Stderr)
+		if errors.Is(err, ff.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if *flagVersion {
+		fmt.Println(version.Main())
+		return nil
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	return appCmd.ParseAndRun(ctx, os.Args[1:])
+	return appCmd.Run(ctx)
 }
 
 func (c *collector) getMaxIssueID(ctx context.Context) (max int, err error) {
