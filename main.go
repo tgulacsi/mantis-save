@@ -5,6 +5,7 @@
 package main
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
 	"context"
@@ -24,17 +25,16 @@ import (
 	"os/exec"
 	"os/signal"
 	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/net/html"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/UNO-SOFT/zlog/v2"
-	"github.com/google/renameio/v2"
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffhelp"
 	"github.com/tgulacsi/go/version"
@@ -90,6 +90,7 @@ func Main() error {
 	flagFirst := FS.Int("first", 1, "first issue to dump")
 	flagLast := FS.Int("last", 0, "last issue to dump (finds from my_view_page if <1")
 	flagConcurrency := FS.Int("concurrency", 8, "concurrency")
+	flagCompressor := FS.String("compressor", "zstd", "compressor to use in tar2sqfs")
 	saveCmd := ff.Command{Name: "save",
 		Flags: ff.NewFlagSetFrom(FS.Name(), FS),
 		Exec: func(ctx context.Context, args []string) error {
@@ -106,44 +107,65 @@ func Main() error {
 
 			}
 
-			tempDir, err := os.MkdirTemp("", *flagOut)
-			if err != nil {
-				return err
-			}
-			defer os.RemoveAll(tempDir)
+			// tempDir, err := os.MkdirTemp("", *flagOut)
+			// if err != nil {
+			// 	return err
+			// }
+			// defer os.RemoveAll(tempDir)
 
 			var zwMu sync.Mutex
 			zwSeen := make(map[string]struct{})
 			u := c.URL
+			uid, gid, now := os.Getuid(), os.Getgid(), time.Now()
+			pr, pw := io.Pipe()
+			sqCmd := exec.CommandContext(ctx, "tar2sqfs", "-q", "-c", *flagCompressor, *flagOut)
+			sqCmd.Stdin = pr
+			sqCmd.Stdout, sqCmd.Stderr = os.Stdout, os.Stderr
+			if err := sqCmd.Start(); err != nil {
+				return err
+			}
+			tw := tar.NewWriter(pw)
+			finish := func(err error) {
+				tw.Close()
+				pw.CloseWithError(err)
+			}
 			cl := cloner{
 				c:  c,
 				vl: &visitLimiter{prefix: (&url.URL{Scheme: u.Scheme, Host: u.Host, Path: path.Dir(u.Path)}).String()},
-				WriteFile: func(fn string, compress bool, body []byte) error {
+				WriteFile: func(fn string, body []byte) error {
 					zwMu.Lock()
 					defer zwMu.Unlock()
 					if _, ok := zwSeen[fn]; ok {
 						return nil
 					}
 					zwSeen[fn] = struct{}{}
-					return renameio.WriteFile(filepath.Join(tempDir, fn), body, 0640)
+					if err := tw.WriteHeader(&tar.Header{
+						Typeflag: tar.TypeReg,
+						Name:     fn, Size: int64(len(body)),
+						Mode: 0444, Uid: uid, Gid: gid,
+						ModTime: now,
+					}); err != nil {
+						return err
+					}
+					// return renameio.WriteFile(filepath.Join(tempDir, fn), body, 0640)
+					_, err = tw.Write(body)
+					return err
 				},
 			}
 
 			links := make([]string, max-*flagFirst+1)
 			logger.Info("links", "first:", *flagFirst, "last:", max)
-			limitCh := make(chan struct{}, *flagConcurrency)
 			errCh := make(chan error, 1000)
 			var grp errgroup.Group
+			grp.SetLimit(*flagConcurrency)
 			for i := *flagFirst; i <= max; i++ {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
 				i := i
 				s := appendPath(u, "view.php") + "?id=" + strconv.Itoa(i)
-				limitCh <- struct{}{}
 				cl := cl
 				grp.Go(func() error {
-					defer func() { <-limitCh }()
 					link, err := cl.Clone(ctx, s)
 					if err != nil {
 						err = fmt.Errorf("visit %q: %w", u.String(), err)
@@ -159,6 +181,7 @@ func Main() error {
 				})
 			}
 			if err := grp.Wait(); err != nil {
+				finish(err)
 				return err
 			}
 			close(errCh)
@@ -168,38 +191,29 @@ func Main() error {
 				n++
 			}
 			if n > 100 {
-				return fmt.Errorf("too much errors: %d", n)
-			}
-
-			indexFh, err := renameio.NewPendingFile(filepath.Join(tempDir, "index.html"))
-			if err != nil {
+				err = fmt.Errorf("too much errors: %d", n)
+				finish(err)
 				return err
 			}
-			defer indexFh.Cleanup()
-			w := indexFh
-			fmt.Fprintf(w, `<!DOCTYPE html>
+
+			var buf bytes.Buffer
+			fmt.Fprintf(&buf, `<!DOCTYPE html>
 <html><head><title>%s</title><head><body><p>
 `, path.Dir(u.Path))
 			for i, link := range links {
 				if i != 0 && i%100 == 0 {
-					io.WriteString(w, "\n</p><p>\n")
+					io.WriteString(&buf, "\n</p><p>\n")
 				}
-				fmt.Fprintf(w, "<a href=\"%s\">%d</a>\n", link, i+*flagFirst)
+				fmt.Fprintf(&buf, "<a href=\"%s\">%d</a>\n", link, i+*flagFirst)
 			}
-			io.WriteString(w, "\n</p></body></html>")
-
-			if err = indexFh.CloseAtomicallyReplace(); err != nil {
+			io.WriteString(&buf, "\n</p></body></html>")
+			err = cl.WriteFile("index.html", buf.Bytes())
+			finish(err)
+			if err != nil {
 				return err
 			}
 
-			cmd := exec.CommandContext(ctx, "mksquashfs", tempDir, *flagOut, "-comp", "xz")
-			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-
-			if err := cmd.Run(); err != nil {
-				return fmt.Errorf("%q: %w", cmd.Args, err)
-			}
-
-			return nil
+			return sqCmd.Wait()
 		},
 	}
 
@@ -207,6 +221,7 @@ func Main() error {
 	flagVersion := FFS.BoolLong("version", "print version")
 	appCmd := ff.Command{Name: "mantis-save",
 		Flags:       FFS,
+		Exec:        saveCmd.Exec,
 		Subcommands: []*ff.Command{&saveCmd, &maxCmd},
 	}
 	if err := appCmd.Parse(os.Args[1:]); err != nil {
@@ -219,6 +234,9 @@ func Main() error {
 	if *flagVersion {
 		fmt.Println(version.Main())
 		return nil
+	}
+	if *flagConcurrency < 1 {
+		*flagConcurrency = 1
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -261,9 +279,9 @@ type cloner struct {
 	c         *collector
 	vl        *visitLimiter
 	linkMap   map[string]string
-	linkPairs []string
 	htmls     map[string]string
-	WriteFile func(fn string, compress bool, body []byte) error
+	WriteFile func(fn string, body []byte) error
+	linkPairs []string
 }
 
 func (cl *cloner) Clone(ctx context.Context, URL string) (string, error) {
@@ -309,7 +327,7 @@ func (cl *cloner) Clone(ctx context.Context, URL string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("%q: %w", fn, err)
 		}
-		err = cl.WriteFile(fn, true, buf.Bytes())
+		err = cl.WriteFile(fn, buf.Bytes())
 		if err != nil {
 			return "", err
 		}
@@ -348,12 +366,7 @@ func (cl *cloner) collector() (visit func(context.Context, string) error) {
 				cl.htmls[s] = string(body)
 				//cl.mu.Unlock()
 			} else {
-				var compress bool
-				switch ext {
-				case ".csv", ".txt", ".css", ".xml", ".log", ".js", ".php":
-					compress = true
-				}
-				return cl.WriteFile(fn, compress, body)
+				return cl.WriteFile(fn, body)
 			}
 			return nil
 		}
@@ -596,9 +609,9 @@ type tagAttr struct {
 type visitTodoMap map[tagAttr]func(URL *url.URL, value string) error
 
 type visitLimiter struct {
-	mu     sync.RWMutex
 	seen   map[string]struct{}
 	prefix string
+	mu     sync.RWMutex
 }
 
 func (vl *visitLimiter) Allow(URL string) bool {
